@@ -1,0 +1,45 @@
+#!/bin/sh
+# Nightly backup of Roasted, the coffee log (installed by setup-roasted.sh). Runs from /etc/periodic/daily
+# just before ct210-backup, using the same settings, folder and log, so all CT 210 apps land together:
+#   $LOCAL_DIR/<date>/roasted-roasted.db.gz          (kept KEEP_DAYS days)
+#   $BACKUP_TARGET/db/<date>/...  + $BACKUP_TARGET/files/roasted/photos/   (if BACKUP_TARGET is set)
+# Config: /etc/conf.d/ct210-ops     Log: /var/log/ct210-ops.log
+set -u
+[ -f /etc/conf.d/ct210-ops ] && . /etc/conf.d/ct210-ops
+LOCAL_DIR=${LOCAL_DIR:-/var/backups/ct210}
+KEEP_DAYS=${KEEP_DAYS:-14}
+BACKUP_TARGET=${BACKUP_TARGET:-}
+STAMP=$(date +%Y-%m-%d)
+LOG=/var/log/ct210-ops.log
+DB=/var/lib/roasted/roasted.db
+log() { echo "$(date '+%F %T') roasted-backup: $*" >> "$LOG"; }
+
+fail=0
+mkdir -p "$LOCAL_DIR/$STAMP"
+out="$LOCAL_DIR/$STAMP/roasted-roasted.db"
+if [ -f "$DB" ]; then
+  if sqlite3 "$DB" ".backup '$out'" && [ "$(sqlite3 "$out" 'PRAGMA integrity_check;')" = "ok" ]; then
+    gzip -f "$out"
+    log "ok roasted/roasted.db ($(du -h "$out.gz" | cut -f1))"
+  else
+    log "FAILED roasted/roasted.db"; fail=1
+  fi
+fi
+find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_DAYS" -exec rm -rf {} + 2>/dev/null
+
+if [ -n "$BACKUP_TARGET" ]; then
+  if [ -d "$BACKUP_TARGET" ] && [ -w "$BACKUP_TARGET" ]; then
+    mkdir -p "$BACKUP_TARGET/db/$STAMP" "$BACKUP_TARGET/files/roasted/photos"
+    cp -a "$out.gz" "$BACKUP_TARGET/db/$STAMP/" 2>/dev/null || fail=1
+    # photos are write-once: copy new files only
+    cp -au /var/lib/roasted/photos/. "$BACKUP_TARGET/files/roasted/photos/" || fail=1
+    log "roasted copied to $BACKUP_TARGET"
+  else
+    log "FAILED: BACKUP_TARGET $BACKUP_TARGET is not a writable directory (is it mounted?)"; fail=1
+  fi
+fi
+
+if [ "$fail" != 0 ] && [ -x /usr/local/bin/ct210-notify ]; then
+  /usr/local/bin/ct210-notify "Roasted backup" down "Last night's Roasted backup had a problem. See /var/log/ct210-ops.log."
+fi
+exit $fail
