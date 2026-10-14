@@ -38,7 +38,13 @@ if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PORT\$"; then
 fi
 
 echo "==> Creating user and folders"
-id "$SVC_USER" >/dev/null 2>&1 || adduser -S -D -H -h "$DATA_DIR" -s /sbin/nologin "$SVC_USER"
+# BusyBox adduser -S puts a new user in "nogroup" unless told otherwise, so make the app's own group first.
+grep -q "^$SVC_USER:" /etc/group || addgroup -S "$SVC_USER"
+if ! id "$SVC_USER" >/dev/null 2>&1; then
+  adduser -S -D -H -h "$DATA_DIR" -s /sbin/nologin -G "$SVC_USER" "$SVC_USER"
+elif ! id -nG "$SVC_USER" | tr ' ' '\n' | grep -qx "$SVC_USER"; then
+  addgroup "$SVC_USER" "$SVC_USER"   # user from an older install: add it to its group
+fi
 mkdir -p "$APP_DIR" "$DATA_DIR/photos" /var/backups/ct210
 
 echo "==> Unpacking app"
@@ -48,7 +54,7 @@ rm -rf "$APP_DIR.new" && mv "$TMP/roasted" "$APP_DIR.new"
 rm -rf "$APP_DIR.old"; [ -d "$APP_DIR" ] && mv "$APP_DIR" "$APP_DIR.old"
 mv "$APP_DIR.new" "$APP_DIR"; rm -rf "$APP_DIR.old" "$TMP"
 chown -R root:root "$APP_DIR"
-chown -R "$SVC_USER" "$DATA_DIR"
+chown -R "$SVC_USER:$SVC_USER" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
 
 # ---------------------------------------------------------------- config
