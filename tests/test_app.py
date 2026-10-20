@@ -125,3 +125,31 @@ def test_method_presets_and_migration():
     coffee.migrate(con)
     assert "brewer" in {r[1] for r in con.execute("PRAGMA table_info(reviews)")}
     assert "grind" in {r[1] for r in con.execute("PRAGMA table_info(methods)")}
+
+
+def test_map_places_bags_and_falls_back_to_roaster(monkeypatch):
+    places = {"Santa Barbara": (34.42, -119.70), "Carpinteria": (34.40, -119.52)}
+    monkeypatch.setattr(coffee, "geocode_place", lambda city, region, country: places.get(city))
+    monkeypatch.setattr(coffee.time, "sleep", lambda s: None)
+    # misspelled purchase city: not found, so the bag shows at the roaster's city
+    typo = add_bag(roaster={"name": "Dart Coffee Co.", "city": "Santa Barbara", "region": "CA"},
+                   coffee={"name": "Ethiopia Kayon Mountain"},
+                   bag={"city": "Carpeneria", "region": "CA", "country": "United States", "shop": "Dart Coffee Co"})
+    assert typo["lat"] is None and typo["map"] == "roaster"
+    # fixing the spelling looks the place up again
+    fixed = c.put(f"/admin/api/bags/{typo['id']}", json={"city": "Carpinteria"}).get_json()
+    assert fixed["lat"] == 34.40 and fixed["map"] == "bought"
+    # bought online, roaster with no city: nowhere to put it
+    add_bag(roaster={"name": "Nowhere Roasters"}, coffee={"name": "Mystery"}, bag={"online": True})
+    pts = c.get("/admin/api/map").get_json()
+    kinds = {p["coffee_name"]: p["kind"] for p in pts["points"]}
+    assert kinds["Ethiopia Kayon Mountain"] == "bought" and "Mystery" not in kinds and pts["unplaced"] >= 1
+    # an older bag that was never looked up gets placed when the map opens
+    con = coffee.connect()
+    bid = con.execute("INSERT INTO bags(coffee_id, city, online) VALUES (?, 'Carpinteria', 0)", (typo["coffee"]["id"],)).lastrowid
+    con.commit()
+    c.get("/admin/api/map")
+    assert tuple(coffee.connect().execute("SELECT lat, geo_tried FROM bags WHERE id=?", (bid,)).fetchone()) == (34.40, 1)
+    # the public view never shows GPS points or lookup flags
+    pub = c.get(f"/api/bags/{typo['id']}", headers={"Cf-Ray": "x"}).get_json()
+    assert "lat" not in pub and "geo_tried" not in pub and "map" not in pub and "lat" not in pub["roaster"]

@@ -128,13 +128,23 @@ def _close(_exc):
 
 def migrate(con):
     """Add columns that newer versions expect to an older database."""
-    def cols(t):
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+    def cols(t):  # a missing table reports every column as present, so nothing is altered
+        if t not in tables:
+            return {"lat", "lng", "geo_tried", "brewer", "grinder", "grind", "recipe"}
         return {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
     for col in ("grinder", "grind", "brewer", "recipe"):
         if col not in cols("methods"):
             con.execute(f"ALTER TABLE methods ADD COLUMN {col} TEXT")
     if "brewer" not in cols("reviews"):
         con.execute("ALTER TABLE reviews ADD COLUMN brewer TEXT")
+    # map: roasters get coordinates for their city; geo_tried marks a place lookup already attempted
+    for col, typ in (("lat", "REAL"), ("lng", "REAL"), ("geo_tried", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in cols("roasters"):
+            con.execute(f"ALTER TABLE roasters ADD COLUMN {col} {typ}")
+    if "geo_tried" not in cols("bags"):
+        con.execute("ALTER TABLE bags ADD COLUMN geo_tried INTEGER NOT NULL DEFAULT 0")
 
 
 def init_db():
@@ -342,7 +352,7 @@ def healthz():
 
 
 # ======================================================================= serializers
-PRIVATE_BAG = ("price", "currency", "notes", "lat", "lng", "added_by")
+PRIVATE_BAG = ("price", "currency", "notes", "lat", "lng", "added_by", "geo_tried")
 PRIVATE_REVIEW = ("reviewed_by",)
 
 
@@ -512,6 +522,12 @@ def get_bag(bag_id, private):
     d["roaster"] = dict(db().execute("SELECT * FROM roasters WHERE id=?", (c["roaster_id"],)).fetchone())
     d["reviews"] = [review_out(r, private, b["roast_date"]) for r in db().execute(
         "SELECT * FROM reviews WHERE bag_id=? ORDER BY coalesce(brewed_on, updated_at) DESC", (bag_id,))]
+    if private:
+        d["map"] = ("bought" if b["lat"] is not None else
+                    "roaster" if d["roaster"].get("lat") is not None else None)
+    d["roaster"].pop("geo_tried", None)
+    if not private:
+        d["roaster"].pop("lat", None); d["roaster"].pop("lng", None)
     d["other_bags"] = [dict(r) for r in db().execute(
         "SELECT id, purchased_on, shop, city FROM bags WHERE coffee_id=? AND id<>? ORDER BY purchased_on DESC",
         (b["coffee_id"], bag_id))]
@@ -732,13 +748,29 @@ def shelf():
 @app.get("/admin/api/map")
 @editor_required
 def map_points():
-    rows = db().execute("""SELECT b.id, b.lat, b.lng, b.shop, b.city, b.country, b.purchased_on, b.trip,
-              c.id AS coffee_id, c.name AS coffee_name, r.name AS roaster_name,
+    """Each bag where it was bought; a bag with no purchase location (bought online, or a place the lookup
+    couldn't find) sits at its roaster's city instead, marked kind="roaster"."""
+    con = db()
+    backfill_locations(con)
+    rows = con.execute("""SELECT b.id, b.lat, b.lng, b.shop, b.city, b.country, b.purchased_on, b.trip, b.online,
+              c.id AS coffee_id, c.name AS coffee_name, r.name AS roaster_name, r.city AS roaster_city,
+              r.lat AS r_lat, r.lng AS r_lng,
               (SELECT max(rating) FROM reviews WHERE bag_id=b.id) AS best
-            FROM bags b JOIN coffees c ON c.id=b.coffee_id JOIN roasters r ON r.id=c.roaster_id
-            WHERE b.lat IS NOT NULL AND b.lng IS NOT NULL""").fetchall()
+            FROM bags b JOIN coffees c ON c.id=b.coffee_id JOIN roasters r ON r.id=c.roaster_id""").fetchall()
     ph = photos_for([r["id"] for r in rows])
-    return jsonify(points=[dict(r, photo=(ph.get(r["id"]) or [{}])[0].get("thumb")) for r in rows])
+    points, unplaced = [], 0
+    for r in rows:
+        d = dict(r, photo=(ph.get(r["id"]) or [{}])[0].get("thumb"))
+        lat, lng = d.pop("r_lat"), d.pop("r_lng")
+        if d["lat"] is not None and d["lng"] is not None:
+            d["kind"] = "bought"
+        elif lat is not None and lng is not None:
+            d.update(lat=lat, lng=lng, kind="roaster")
+        else:
+            unplaced += 1
+            continue
+        points.append(d)
+    return jsonify(points=points, unplaced=unplaced)
 
 
 # ========================================================================= photos
@@ -890,6 +922,8 @@ def find_or_create_roaster(data):
         return r["id"]
     cur = con.execute(f"INSERT INTO roasters({','.join(vals)}) VALUES ({','.join('?' * len(vals))})",
                       list(vals.values()))
+    if vals.get("city"):
+        locate_roaster(con, cur.lastrowid)
     return cur.lastrowid
 
 
@@ -932,8 +966,11 @@ def update_roaster(rid):
         if dup:
             return make_err(409, "Another roaster already has that name — use Merge instead", roaster_id=dup["id"])
     if vals:
+        old = dict(con.execute("SELECT city, region, country FROM roasters WHERE id=?", (rid,)).fetchone())
         con.execute(f"UPDATE roasters SET {','.join(f'{k}=?' for k in vals)}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     [*vals.values(), rid])
+        if any(k in vals and vals[k] != old[k] for k in ("city", "region", "country")):
+            locate_roaster(con, rid)
         con.commit()
     return get_roaster(rid, private=True)
 
@@ -1067,9 +1104,10 @@ def bag_values(data):
 
 
 def geocode_place(city, region, country):
-    """Best-effort city -> lat/lng (OpenStreetMap Nominatim) so the map works without GPS."""
+    """Best-effort place name -> (lat, lng) so the map works without GPS.
+    OpenStreetMap Nominatim first; then Photon (also OpenStreetMap data), which tolerates misspellings."""
     q = ", ".join(x for x in (city, region, country) if x)
-    if not q:
+    if not city or not q:
         return None
     try:
         res = http_json("https://nominatim.openstreetmap.org/search?" +
@@ -1077,8 +1115,43 @@ def geocode_place(city, region, country):
         if res:
             return float(res[0]["lat"]), float(res[0]["lon"])
     except Exception as e:  # noqa: BLE001
-        app.logger.info("geocode failed for %s: %s", q, e)
+        app.logger.info("Nominatim lookup failed for %s: %s", q, e)
+    try:
+        res = http_json("https://photon.komoot.io/api/?" + urllib.parse.urlencode({"q": q, "limit": 1, "lang": "en"}), timeout=6)
+        feats = res.get("features") or []
+        if feats:
+            lng, lat = feats[0]["geometry"]["coordinates"][:2]
+            return float(lat), float(lng)
+    except Exception as e:  # noqa: BLE001
+        app.logger.info("Photon lookup failed for %s: %s", q, e)
+    app.logger.warning("No map location found for %s", q)
     return None
+
+
+def locate_roaster(con, rid):
+    """Look up a roaster's city once, for the map."""
+    r = con.execute("SELECT city, region, country FROM roasters WHERE id=?", (rid,)).fetchone()
+    ll = geocode_place(r["city"], r["region"], r["country"]) if r and r["city"] else None
+    con.execute("UPDATE roasters SET lat=?, lng=?, geo_tried=1 WHERE id=?", (*(ll or (None, None)), rid))
+
+
+def backfill_locations(con, budget=4):
+    """Places not looked up yet (older data, or a lookup service that was down): a few per map view."""
+    pending = [("bag", r) for r in con.execute(
+        "SELECT id, city, region, country FROM bags WHERE lat IS NULL AND online=0 AND city IS NOT NULL AND geo_tried=0 LIMIT ?",
+        (budget,))]
+    pending += [("roaster", r) for r in con.execute(
+        "SELECT id FROM roasters WHERE lat IS NULL AND city IS NOT NULL AND geo_tried=0 LIMIT ?", (budget,))]
+    for i, (kind, r) in enumerate(pending[:budget]):
+        if i:
+            time.sleep(1.1)  # OpenStreetMap's usage policy: at most one request a second
+        if kind == "bag":
+            ll = geocode_place(r["city"], r["region"], r["country"])
+            con.execute("UPDATE bags SET lat=?, lng=?, geo_tried=1 WHERE id=?", (*(ll or (None, None)), r["id"]))
+        else:
+            locate_roaster(con, r["id"])
+    if pending:
+        con.commit()
 
 
 @app.post("/admin/api/bags")
@@ -1096,6 +1169,7 @@ def create_bag():
         ll = geocode_place(vals.get("city"), vals.get("region"), vals.get("country"))
         if ll:
             vals["lat"], vals["lng"] = ll
+        vals["geo_tried"] = 1
     vals["added_by"] = who()
     cur = con.execute(f"INSERT INTO bags(coffee_id, {','.join(vals)}) VALUES (?, {','.join('?' * len(vals))})",
                       [cid, *vals.values()])
@@ -1123,6 +1197,7 @@ def update_bag(bag_id):
         ll = geocode_place(vals.get("city", row["city"]), vals.get("region", row["region"]),
                            vals.get("country", row["country"]))
         vals["lat"], vals["lng"] = ll if ll else (None, None)
+        vals["geo_tried"] = 1
     if vals:
         con.execute(f"UPDATE bags SET {','.join(f'{k}=?' for k in vals)}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     [*vals.values(), bag_id])

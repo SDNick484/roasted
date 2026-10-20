@@ -248,7 +248,7 @@ async function bagView(id) {
       <div><div class="gallery" id="gal">${b.photos.length ? b.photos.map((p) => img(p.file, false)).join("") : `<div class="ph">${BEAN}</div>`}</div>
         ${ADMIN ? `<div class="thumbs">${b.photos.map((p, i) => `<span class="ti">${img(p.file)}<button data-del="${p.id}" title="Remove photo" aria-label="Remove photo">${icon("x")}</button>
             ${i ? `<button data-cover="${p.id}" title="Make this the main photo" aria-label="Make this the main photo" style="left:-8px;right:auto">${icon("star")}</button>` : ""}</span>`).join("")}</div>
-          <div class="picker" style="margin-top:8px"><label class="btn">${icon("camera")} Add photos<input type="file" accept="image/*" multiple id="addph"></label></div>` : ""}
+          <div class="picker" style="margin-top:8px">${photoPicker("bag-photo-in", false)}</div>` : ""}
       </div>
       <div>
         <a class="crumb" href="#/roaster/${b.roaster.id}">${esc(b.roaster.name)}${b.roaster.city ? " · " + esc(b.roaster.city) : ""}</a>
@@ -258,6 +258,7 @@ async function bagView(id) {
         <dl class="facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}
           ${b.roast_age_today != null ? `<dt>Today</dt><dd>${ageText(b.roast_age_today)}</dd>` : ""}</dl>
         ${ADMIN && b.notes ? `<p class="note">${esc(b.notes)}</p>` : ""}
+        ${ADMIN && !b.online && b.map !== "bought" && b.city ? `<p class="note warn">${icon("pin")} Couldn't find “${esc(b.city)}” on the map${b.map === "roaster" ? `, so this bag shows at ${esc(b.roaster.name)}'s city instead` : ""}. Check the spelling in <a href="#/bag/${b.id}/edit">Edit bag</a>.</p>` : ""}
         ${ADMIN ? `<div class="actions">
           ${b.status === "sealed" ? `<button id="open">Opened today</button>` : ""}
           ${b.status !== "finished" ? `<button id="finish">Finished it</button>` : `<button id="unfinish" class="link">Not finished after all</button>`}
@@ -276,13 +277,13 @@ async function bagView(id) {
   $("#open") && ($("#open").onclick = () => put({ opened_on: todayISO() }, "Marked open"));
   $("#finish") && ($("#finish").onclick = () => put({ finished_on: todayISO(), opened_on: b.opened_on || todayISO() }, "Marked finished"));
   $("#unfinish") && ($("#unfinish").onclick = () => put({ finished_on: null }, "Back on the shelf"));
-  $("#addph").onchange = async (e) => {
+  $$(".bag-photo-in").forEach((inp) => inp.onchange = async (e) => {
+    if (!e.target.files.length) return;
     const fd = new FormData();
     for (const file of e.target.files) fd.append("file", await shrink(file), "photo.jpg");
     toast("Uploading…");
-    await api(`bags/${id}/photos`, { method: "POST", body: fd });
-    bagView(id);
-  };
+    try { await api(`bags/${id}/photos`, { method: "POST", body: fd }); bagView(id); } catch (err) { toast(err.message); }
+  });
   $$("[data-del]").forEach((x) => x.onclick = async () => { if (!confirm("Remove this photo?")) return; await api("photos/" + x.dataset.del, { method: "DELETE" }); bagView(id); });
   $$("[data-cover]").forEach((x) => x.onclick = async () => { await api(`photos/${x.dataset.cover}/cover`, { method: "POST" }); bagView(id); });
 }
@@ -337,7 +338,7 @@ async function reviewView(bagId, method) {
         <div class="f"><span>Rating</span><div class="rating-in"><span id="rv">${rate(r.rating)}</span>
           <div><input type="range" name="rating" min="0" max="10" step="0.5" value="${r.rating ?? 7}" ${r.rating == null ? 'data-unset="1"' : ""} aria-label="Rating out of 10">
           <div class="ticks"><span>0</span><span>2</span><span>4</span><span>6</span><span>8</span><span>10</span></div></div></div>
-          ${r.rating == null ? `<span class="hint" id="rhint">Slide to rate</span>` : ""}</div>
+          ${r.rating == null ? `<span class="hint" id="rhint">Not rated yet: tap or slide the bar</span>` : ""}</div>
         <label class="f"><span>Tasting notes (comma separated)</span><input name="flavors" value="${esc(r.flavors || "")}" placeholder="blueberry, cocoa, jasmine"></label>
         <div class="chips" id="fl">${sugg.map((s) => `<button type="button" class="chip" data-f="${esc(s)}">${esc(s)}</button>`).join("")}</div>
         <label class="f"><span>Notes</span><textarea name="notes" placeholder="What stood out? What would you change next time?">${esc(r.notes || "")}</textarea></label>
@@ -362,7 +363,9 @@ async function reviewView(bagId, method) {
     </form>`;
   const fm = $("#rf");
   const range = fm.rating;
-  range.oninput = () => { delete range.dataset.unset; $("#rv").innerHTML = rate(+range.value); $("#rhint") && $("#rhint").remove(); };
+  // A tap on the knob where it already sits fires no "input" event, so any touch, click or key on the bar counts as rating it.
+  const rated = () => { delete range.dataset.unset; $("#rv").innerHTML = rate(+range.value); $("#rhint") && $("#rhint").remove(); };
+  ["input", "change", "pointerup", "keyup"].forEach((ev) => range.addEventListener(ev, rated));
   const applyKind = () => {
     const k = methodKind(fm.method.value === "__new" ? fm.new_method.value : fm.method.value);
     for (const [key, val] of Object.entries(k.l)) $(`[data-l=${key}]`).textContent = val;
@@ -401,7 +404,16 @@ async function reviewView(bagId, method) {
     if (d.method === "__new") d.method = d.new_method;
     delete d.new_method;
     if (!d.method) return toast("Pick a brew method");
-    if (range.dataset.unset) d.rating = null;
+    if (range.dataset.unset) {
+      if (!fm.dataset.noRatingOk) {  // first Save without a rating: say so once; a second Save goes through
+        fm.dataset.noRatingOk = "1";
+        $("#rhint") && ($("#rhint").textContent = "No rating yet. Tap the bar to rate, or tap Save again to save without one.");
+        toast("No rating yet. Tap Save again to save without one.");
+        $("#rv").scrollIntoView({ block: "center", behavior: "smooth" });
+        return;
+      }
+      d.rating = null;
+    }
     if (existing) d.old_method = existing.method;
     try {
       const res = await api(`bags/${bagId}/reviews`, { method: "PUT", body: d });
@@ -419,12 +431,17 @@ async function reviewView(bagId, method) {
 /* ---------- add / edit bag ---------- */
 const PROCESSES = ["washed", "natural", "honey", "anaerobic natural", "anaerobic washed", "wet-hulled", "carbonic maceration", "decaf (swiss water)", "decaf (sugarcane EA)"];
 const ROASTS = ["", "light", "medium-light", "medium", "medium-dark", "dark", "omni", "filter", "espresso"];
-const fld = (label, name, val = "", attrs = "") => `<label class="f"><span>${label}</span><input name="${name}" value="${esc(val ?? "")}" ${attrs}></label>`;
+// Every field opts out of browser autofill: Chrome's address autofill otherwise fills a coffee's origin and region
+// (and the roaster's city) with the purchase address. An unrecognized token is what Chrome reliably respects.
+const fld = (label, name, val = "", attrs = "") => `<label class="f"><span>${label}</span><input name="${name}" value="${esc(val ?? "")}" ${/autocomplete=/.test(attrs) ? "" : `autocomplete="roasted-${name}"`} ${attrs}></label>`;
+// Two pickers: Android drops the camera option when a picker allows several files, so "Take photo" is its own button.
+const photoPicker = (cls, primary) => `<label class="btn ${primary ? "primary" : ""}">${icon("camera")} Take photo<input type="file" accept="image/*" capture="environment" class="${cls}"></label>
+  <label class="btn">${icon("plus")} Choose photos<input type="file" accept="image/*" multiple class="${cls}"></label>`;
 
 function coffeeFields(c = {}, prefix = "c_") {
   return `
     ${fld("Coffee name", prefix + "name", c.name, `required list="coffee-names" placeholder="e.g. Ethiopia Guji Hambela"`)}
-    <div class="f2">${fld("Origin (country)", prefix + "origin", c.origin, `list="origins" placeholder="Ethiopia"`)}${fld("Region", prefix + "region", c.region, `placeholder="Guji, Oromia"`)}</div>
+    <div class="f2">${fld("Origin", prefix + "origin", c.origin, `list="origins" placeholder="Ethiopia"`)}${fld("Region", prefix + "region", c.region, `placeholder="Guji, Oromia"`)}</div>
     <div class="f2">${fld("Process", prefix + "process", c.process, `list="processes"`)}
       <label class="f"><span>Roast level</span><select name="${prefix}roast_level">${ROASTS.map((r) => `<option value="${r}" ${r === (c.roast_level || "") ? "selected" : ""}>${r ? cap(r) : "—"}</option>`).join("")}</select></label></div>
     ${fld("Tasting notes on the bag", prefix + "roaster_notes", c.roaster_notes, `placeholder="blueberry, jasmine, cocoa"`)}
@@ -489,10 +506,10 @@ async function addView(p) {
       <div class="muted small">${preset ? esc(preset.name) + " · " + esc(preset.roaster.name) : "Snap the bag, let Claude read the label, then check the details."}</div></div>
     <form class="form" id="af" autocomplete="off">
       <fieldset><legend>Photos</legend>
-        <div class="picker"><label class="btn primary">${icon("camera")} Take or add photos<input type="file" accept="image/*" multiple id="ph"></label>
+        <div class="picker">${photoPicker("photo-in", true)}
           ${!preset && ft.label_reading ? `<button type="button" id="read" disabled>${icon("sparkle")} Read the label</button>` : ""}</div>
         <div class="thumbs" id="thumbs"></div>
-        <div class="hint">${preset ? "Optional." : ft.label_reading ? "Front and back of the bag work best. Reading takes ~10 seconds." : "Label reading is off until ANTHROPIC_API_KEY is set in /etc/conf.d/roasted."}</div>
+        <div class="hint">${preset ? "Optional." : ft.label_reading ? "Take the front and back of the bag (one photo at a time), then read the label. Reading takes about 10 seconds." : "Label reading is off until ANTHROPIC_API_KEY is set in /etc/conf.d/roasted."}</div>
         <div id="readnote"></div>
       </fieldset>
       <fieldset ${preset ? 'class="hidden"' : ""}><legend>Roaster</legend>
@@ -513,14 +530,15 @@ async function addView(p) {
     $$("[data-rm]").forEach((x) => x.onclick = () => { uploads.splice(+x.dataset.rm, 1); thumbs(); });
     $("#read") && ($("#read").disabled = !uploads.length);
   };
-  $("#ph").onchange = async (e) => {
+  $$(".photo-in").forEach((inp) => inp.onchange = async (e) => {
+    if (!e.target.files.length) return;
     const fd = new FormData();
     for (const file of e.target.files) fd.append("file", await shrink(file), "photo.jpg");
     e.target.value = "";
     $("#readnote").innerHTML = `<span class="spinner"></span> Uploading…`;
     try { const r = await api("uploads", { method: "POST", body: fd }); uploads.push(...r.uploads); $("#readnote").innerHTML = ""; thumbs(); }
     catch (err) { $("#readnote").textContent = err.message; }
-  };
+  });
   // roaster -> coffee name suggestions, and "this is a coffee you already have"
   let roasterCoffees = [];
   const onRoaster = async () => {
@@ -716,20 +734,30 @@ function loadLeaflet() {
   });
 }
 async function mapView() {
-  view.innerHTML = `<div class="spread" style="margin-top:16px"><h2>Where I've bought coffee</h2><span class="muted small" id="mcount"></span></div><div id="map"></div>`;
+  view.innerHTML = `<div class="spread" style="margin-top:16px"><h2>Coffee map</h2><span class="muted small" id="mcount">Finding places…</span></div>
+    <div class="map-legend small"><span><i class="dot bought"></i> Where I bought the bag</span><span><i class="dot roaster"></i> Roaster's city (bought online, or the shop couldn't be found)</span></div>
+    <div id="map"></div>`;
   const [d] = await Promise.all([api("map"), loadLeaflet()]);
-  $("#mcount").textContent = `${d.points.length} bag${d.points.length === 1 ? "" : "s"} with a location`;
+  const nb = d.points.filter((p) => p.kind === "bought").length, nr = d.points.length - nb;
+  $("#mcount").textContent = [`${d.points.length} bag${d.points.length === 1 ? "" : "s"} on the map`, nr ? `${nr} at the roaster's city` : "",
+    d.unplaced ? `${d.unplaced} with no place to show` : ""].filter(Boolean).join(" · ");
   const map = L.map("map", { scrollWheelZoom: true });
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap contributors" }).addTo(map);
-  const accent = getComputedStyle(document.documentElement).getPropertyValue("--green-accent").trim();
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue("--green-accent").trim(), brg = css.getPropertyValue("--green-british-racing").trim();
   const pts = [];
   for (const p of d.points) {
     pts.push([p.lat, p.lng]);
-    L.circleMarker([p.lat, p.lng], { radius: 8, color: "#fff", weight: 2, fillColor: accent, fillOpacity: 0.9 }).addTo(map)
+    const style = p.kind === "bought"
+      ? { radius: 8, color: "#fff", weight: 2, fillColor: accent, fillOpacity: 0.95 }
+      : { radius: 8, color: brg, weight: 3, fillColor: "#fff", fillOpacity: 0.95 };
+    const where = p.kind === "bought" ? [p.shop, p.city].filter(Boolean).join(", ")
+      : `Roaster in ${p.roaster_city}` + (p.online ? " (bought online)" : p.city ? ` (bought in ${p.city}; not found on the map)` : "");
+    L.circleMarker([p.lat, p.lng], style).addTo(map)
       .bindPopup(`${p.photo ? `<img src="/photos/${esc(p.photo)}" alt="">` : ""}<strong><a href="#/bag/${p.id}">${esc(p.coffee_name)}</a></strong><br>
-        ${esc(p.roaster_name)}<br><span style="opacity:.75">${[esc([p.shop, p.city].filter(Boolean).join(", ")), fmtDay(p.purchased_on), p.best != null ? `best ${n1(p.best)}/10` : ""].filter(Boolean).join(" · ")}</span>`);
+        ${esc(p.roaster_name)}<br><span style="opacity:.75">${[esc(where), fmtDay(p.purchased_on), p.best != null ? `best ${n1(p.best)}/10` : ""].filter(Boolean).join(" · ")}</span>`);
   }
-  if (pts.length) map.fitBounds(pts, { padding: [30, 30], maxZoom: 12 }); else map.setView([37.98, -122.03], 4);
+  if (pts.length) map.fitBounds(pts, { padding: [30, 30], maxZoom: 11 }); else map.setView([37.98, -122.03], 4);
 }
 
 /* ---------- stats ---------- */

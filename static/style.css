@@ -265,3 +265,13 @@ button:disabled { opacity: .45; cursor: default; transform: none; }
 .thumbs .ti button .ico { width: 14px; height: 14px; stroke-width: 2.2; }
 .mrow button .ico { width: 16px; height: 16px; }
 .mrow button { min-width: 36px; padding: 7px 10px; }
+.rating-in input[type=range][data-unset] { opacity: .45; }
+.map-legend { display: flex; gap: 6px 18px; flex-wrap: wrap; color: var(--ink-soft); margin-top: 4px; }
+.map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.dot { display: inline-block; width: 14px; height: 14px; border-radius: 50%; }
+.dot.bought { background: var(--green-accent); box-shadow: 0 0 0 2px #fff, 0 0 0 3px var(--hairline); }
+.dot.roaster { background: #fff; border: 3px solid var(--green-british-racing); }
+.note .ico { width: 18px; height: 18px; vertical-align: -3px; }
+.note a { color: var(--link); font-weight: 600; }
+#map { margin-top: 10px; }
+.map-legend .dot.roaster { box-shadow: 0 0 0 2px #fff; }

@@ -43,12 +43,12 @@ The app also verifies the Access JWT itself. Requests that don't come through Cl
 If you'd rather keep the whole thing private, set `PUBLIC_VIEW=0`. `/` then redirects to `/admin`, and photos and the public API need a sign-in.
 
 ## Adding a bag (on the phone)
-1. **＋ Bag → Take or add photos.** Photograph the front and back of the bag.
+1. **＋ Bag → Take photo** for each side of the bag (front, then back), or **Choose photos** to pick several from the gallery. They're separate buttons because Android hides the camera when a picker allows several files.
 2. **Read the label** sends the photos to Claude. It fills in the roaster, coffee name, origin, region, producer, varietal, process, roast level, the tasting notes on the bag, the roast date and the size. It also matches roasters and coffees you already have, so "SIGHTGLASS" becomes your existing *Sightglass Coffee*. Check anything it flags as uncertain, especially roast dates like 03/04.
 3. **Use my location** fills in the GPS point, then looks up the shop, city and country on OpenStreetMap. If you've bought within ~300 m of here before, it reuses that shop name. Location needs HTTPS, so use coffee.nickandrade.com rather than the LAN IP.
 4. Add the trip name (e.g. *Portland, Oct 2026*) so the trip's coffees can be browsed together, plus the price. Then **Save bag**.
 
-Without GPS, the city you type is geocoded when you save, so the bag still lands on the map. Tick **Bought online** to keep it off the map.
+Without GPS, the city you type is looked up when you save (OpenStreetMap Nominatim, then Photon, which tolerates small typos), so the bag still lands on the map. A bag whose city can't be found, or that was **Bought online**, shows at the roaster's city instead (a hollow marker), and its page says so. Places that were never looked up, e.g. while a lookup service was down, are retried a few at a time when the map opens.
 
 ## Reviewing
 On a bag, tap a method chip (**＋ Drip**, **＋ Cold brew**, **＋ Nitro cold brew**, **＋ French press**, **＋ Pour over**, **＋ Percolator**…). The recipe fields follow the method: cold brew, nitro and French press ask for steep time, the percolator for perk time, espresso for yield and shot time. For a method you've used before, the recipe (grinder, grind, dose, water, temp, time) is pre-filled from the last time you brewed it, using the same coffee's recipe first if there is one. Ratings are 0–10 in halves.
