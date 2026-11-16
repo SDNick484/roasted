@@ -132,7 +132,8 @@ button:disabled { opacity: .45; cursor: default; transform: none; }
 .page-h { margin: 24px 0 16px; }
 .crumb { font-size: 14px; color: var(--link); text-decoration: none; font-weight: 600; }
 .crumb:hover { text-decoration: underline; }
-.section-h { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 32px 0 12px; }
+.section-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 32px 0 12px; }
+.section-h h2 { margin: 0; }
 .empty { padding: 48px 10px; text-align: center; color: var(--ink-soft); }
 .foot { color: var(--ink-soft); font-size: 13px; text-align: center; margin: 48px 0 80px; }
 

@@ -64,12 +64,14 @@ async function features() { if (!ADMIN) return {}; if (!S.features) S.features =
 /* ---------- nav / router ---------- */
 function renderNav(path) {
   const items = ADMIN
-    ? [["#/", "Feed"], ["#/coffees", "Coffees"], ["#/roasters", "Roasters"], ["#/map", "Map"], ["#/stats", "Stats"], ["#/more", "More"], ["#/add", "＋ Bag", "add"]]
+    ? [["#/", "Feed"], ["#/coffees", "Coffees"], ["#/roasters", "Roasters"], ["#/map", "Map"], ["#/stats", "Stats"], ["#/more", "More"], ["#/brew", "＋ Brew", "add"], ["#/add", "＋ Bag", "add"]]
     : [["#/", "Feed"], ["#/coffees", "Coffees"], ["#/roasters", "Roasters"], ["#/stats", "Stats"], ["/admin#/", S.editor ? "Edit" : "Sign in"]];
   const sect = path.split("/")[0];
-  const on = (h) => h === "#/" ? sect === "" : h.startsWith("#/") && (sect === h.slice(2) || sect + "s" === h.slice(2));
+  const on = (h) => h === "#/brew"
+    ? (sect === "brew" || /^bag\/\d+\/review$/.test(path))
+    : (h === "#/" ? sect === "" : h.startsWith("#/") && (sect === h.slice(2) || sect + "s" === h.slice(2)));
   $("#nav").innerHTML = items.map(([h, t, c]) => `<a href="${h}" class="${c || ""} ${on(h) ? "on" : ""}">${t}</a>`).join("");
-  $("#fab").classList.toggle("hidden", !ADMIN || sect === "add" || /review|edit/.test(path));
+  $("#fab").classList.toggle("hidden", !ADMIN || sect === "add" || sect === "brew" || /review|edit/.test(path));
 }
 async function route() {
   const hash = location.hash.replace(/^#\/?/, "");
@@ -79,6 +81,7 @@ async function route() {
   window.scrollTo(0, 0);
   let m;
   try {
+    if (path === "brew" && ADMIN) return await reviewView(p.get("bag") ? +p.get("bag") : null, p.get("method"), true);
     if ((m = path.match(/^bag\/(\d+)\/review$/)) && ADMIN) return await reviewView(+m[1], p.get("method"));
     if ((m = path.match(/^bag\/(\d+)\/edit$/)) && ADMIN) return await bagEditView(+m[1]);
     if ((m = path.match(/^bag\/(\d+)$/))) return await bagView(+m[1]);
@@ -130,7 +133,7 @@ async function feedView() {
   if (ADMIN) {
     api("shelf").then((s) => {
       if (!s.bags.length) { $("#shelf").innerHTML = `<div class="note">No open bags. <a href="#/add">Add the bag you just bought</a>.</div>`; return; }
-      $("#shelf").innerHTML = `<div class="section-h"><h2>On the shelf</h2><span class="muted small">${s.bags.length} not finished</span></div>
+      $("#shelf").innerHTML = `<div class="section-h"><h2>On the shelf</h2><div class="row"><span class="muted small">${s.bags.length} not finished</span><a class="btn primary" href="#/brew">＋ Brew</a></div></div>
         <div class="shelf">${s.bags.map(shelfCard).join("")}</div>`;
     }).catch(() => {});
   }
@@ -260,6 +263,7 @@ async function bagView(id) {
         ${ADMIN && b.notes ? `<p class="note">${esc(b.notes)}</p>` : ""}
         ${ADMIN && !b.online && b.map !== "bought" && b.city ? `<p class="note warn">${icon("pin")} Couldn't find “${esc(b.city)}” on the map${b.map === "roaster" ? `, so this bag shows at ${esc(b.roaster.name)}'s city instead` : ""}. Check the spelling in <a href="#/bag/${b.id}/edit">Edit bag</a>.</p>` : ""}
         ${ADMIN ? `<div class="actions">
+          <a class="btn primary" href="#/bag/${b.id}/review">＋ Brew</a>
           ${b.status === "sealed" ? `<button id="open">Opened today</button>` : ""}
           ${b.status !== "finished" ? `<button id="finish">Finished it</button>` : `<button id="unfinish" class="link">Not finished after all</button>`}
           <a class="btn" href="#/bag/${b.id}/edit">Edit bag</a></div>` : ""}
@@ -315,32 +319,64 @@ function methodKind(m) {
   if (/drip|machine|batch/.test(s)) return { l: { water: "Water (g)", time: "Brew time" }, h: { dose: "60", water: "1000", temp: "machine", time: "5:30", recipe: "paper filter, 8-cup setting" } };
   return pour;
 }
-async function reviewView(bagId, method) {
-  const [b, f, ft] = await Promise.all([api("bags/" + bagId), facets(), features()]);
-  const existing = method && b.reviews.find((r) => r.method.toLowerCase() === method.toLowerCase());
+async function reviewView(bagId, method, fromBrew = false) {
+  let shelf = null;
+  if (fromBrew || !bagId) {
+    shelf = await api("shelf?include_finished=1");
+    const allBags = [...(shelf.bags || []), ...(shelf.finished_bags || [])];
+    if (!allBags.length) {
+      view.innerHTML = `<div class="empty">No bags in your log yet. <a href="#/add">Add a bag</a> first.</div>`;
+      return;
+    }
+    bagId = bagId || (shelf.bags[0] || shelf.finished_bags[0]).id;
+  }
+  let [b, f, ft] = await Promise.all([api("bags/" + bagId), facets(), features()]);
+  let existing = method ? b.reviews.find((r) => r.method.toLowerCase() === method.toLowerCase()) : null;
   const r = existing || { method: method || "", brewed_on: todayISO(), rating: null };
   let prefill = {};
   if (!existing && method) prefill = await api(`last-recipe?method=${encodeURIComponent(method)}&coffee_id=${b.coffee.id}`);
-  const v = (k) => r[k] ?? prefill[k] ?? "";
-  const taken = new Set(b.reviews.map((x) => x.method.toLowerCase()));
-  const methods = [...new Set([...f.methods, ...(r.method ? [r.method] : [])])];
-  const sugg = [...new Set([...(b.coffee.roaster_notes || "").toLowerCase().split(/\s*[,/;&]\s*|\s+and\s+/).filter(Boolean), ...f.flavors])].slice(0, 30);
+  const v = (k) => (existing ? existing[k] : prefill[k]) ?? "";
+  let taken = new Set(b.reviews.map((x) => x.method.toLowerCase()));
+  let methods = [...new Set([...f.methods, ...b.reviews.map((x) => x.method), ...(r.method ? [r.method] : [])])];
+
+  const getSugg = () => [...new Set([...(b.coffee.roaster_notes || "").toLowerCase().split(/\s*[,/;&]\s*|\s+and\s+/).filter(Boolean), ...f.flavors])].slice(0, 30);
+
+  let bagSelectHTML = "";
+  if (fromBrew || !bagId) {
+    const bagOption = (x) => `<option value="${x.id}" ${x.id === bagId ? "selected" : ""}>${esc(x.coffee_name)} — ${esc(x.roaster_name)} (${esc(x.status === "finished" ? "finished" : x.status)})</option>`;
+    const shelfGroup = `<optgroup label="On the shelf">${(shelf.bags || []).map(bagOption).join("")}</optgroup>`;
+    const finBags = shelf.finished_bags || [];
+    const finGroup = finBags.length ? `<optgroup label="Finished">${finBags.map(bagOption).join("")}</optgroup>` : "";
+    bagSelectHTML = `<label class="f"><span>Bag</span><select name="bag_id">${shelfGroup}${finGroup}</select></label>`;
+  }
+
+  const renderMethodOptions = (selectedMethod) => {
+    const cur = (selectedMethod || "").toLowerCase();
+    return `<option value="">Pick one…</option>` +
+      methods.map((m) => {
+        const isReviewed = taken.has(m.toLowerCase());
+        const isSel = m.toLowerCase() === cur;
+        return `<option value="${esc(m)}" ${isSel ? "selected" : ""}>${esc(m)}${isReviewed ? " (reviewed)" : ""}</option>`;
+      }).join("") +
+      `<option value="__new" ${cur === "__new" ? "selected" : ""}>Another method…</option>`;
+  };
+
   view.innerHTML = `
     <div class="page-h"><a class="crumb" href="#/bag/${bagId}">← ${esc(b.coffee.name)} · ${esc(b.roaster.name)}</a>
-      <h1>${existing ? "Edit review" : "Review"}${r.method ? ": " + esc(r.method) : ""}</h1>
-      ${b.roast_date ? `<div class="small muted">Roasted ${fmtDay(b.roast_date)}</div>` : ""}</div>
+      <h1>${existing ? "Edit review: " + esc(existing.method) : "Review" + (r.method ? ": " + esc(r.method) : "")}</h1>
+      <div class="small muted" id="roast-info">${b.roast_date ? `Roasted ${fmtDay(b.roast_date)}` : ""}</div></div>
     <form class="form" id="rf" autocomplete="off">
       <fieldset><legend>How was it?</legend>
+        ${bagSelectHTML}
         <label class="f"><span>Brew method</span>
-          <select name="method" required><option value="">Pick one…</option>${methods.map((m) => `<option ${m.toLowerCase() === (r.method || "").toLowerCase() ? "selected" : ""}
-            ${taken.has(m.toLowerCase()) && m.toLowerCase() !== (r.method || "").toLowerCase() ? "disabled" : ""}>${esc(m)}</option>`).join("")}<option value="__new">Another method…</option></select></label>
-        <label class="f hidden" id="newm"><span>New method name</span><input name="new_method" placeholder="e.g. Origami dripper"></label>
+          <select name="method" required>${renderMethodOptions(r.method)}</select></label>
+        <label class="f ${r.method === "__new" ? "" : "hidden"}" id="newm"><span>New method name</span><input name="new_method" placeholder="e.g. Origami dripper"></label>
         <div class="f"><span>Rating</span><div class="rating-in"><span id="rv">${rate(r.rating)}</span>
           <div><input type="range" name="rating" min="0" max="10" step="0.5" value="${r.rating ?? 7}" ${r.rating == null ? 'data-unset="1"' : ""} aria-label="Rating out of 10">
           <div class="ticks"><span>0</span><span>2</span><span>4</span><span>6</span><span>8</span><span>10</span></div></div></div>
-          ${r.rating == null ? `<span class="hint" id="rhint">Not rated yet: tap or slide the bar</span>` : ""}</div>
+          <span class="hint ${r.rating == null ? "" : "hidden"}" id="rhint">Not rated yet: tap or slide the bar</span></div>
         <label class="f"><span>Tasting notes (comma separated)</span><input name="flavors" value="${esc(r.flavors || "")}" placeholder="blueberry, cocoa, jasmine"></label>
-        <div class="chips" id="fl">${sugg.map((s) => `<button type="button" class="chip" data-f="${esc(s)}">${esc(s)}</button>`).join("")}</div>
+        <div class="chips" id="fl">${getSugg().map((s) => `<button type="button" class="chip" data-f="${esc(s)}">${esc(s)}</button>`).join("")}</div>
         <label class="f"><span>Notes</span><textarea name="notes" placeholder="What stood out? What would you change next time?">${esc(r.notes || "")}</textarea></label>
       </fieldset>
       <fieldset><legend>Recipe</legend>
@@ -359,12 +395,12 @@ async function reviewView(bagId, method) {
       <datalist id="grinders">${f.grinders.map((x) => `<option value="${esc(x)}">`).join("")}</datalist>
       <datalist id="brewers">${(f.brewers || []).map((x) => `<option value="${esc(x)}">`).join("")}</datalist>
       <div class="actions sticky-actions"><button class="primary big" type="submit">Save review</button>
-        <a class="btn" href="#/bag/${bagId}">Cancel</a>${existing ? `<button type="button" class="danger" id="del">Delete</button>` : ""}</div>
+        <a class="btn" href="#/bag/${bagId}">Cancel</a><button type="button" class="danger ${existing ? "" : "hidden"}" id="del">Delete</button></div>
     </form>`;
   const fm = $("#rf");
   const range = fm.rating;
   // A tap on the knob where it already sits fires no "input" event, so any touch, click or key on the bar counts as rating it.
-  const rated = () => { delete range.dataset.unset; $("#rv").innerHTML = rate(+range.value); $("#rhint") && $("#rhint").remove(); };
+  const rated = () => { delete range.dataset.unset; $("#rv").innerHTML = rate(+range.value); if ($("#rhint")) $("#rhint").classList.add("hidden"); };
   ["input", "change", "pointerup", "keyup"].forEach((ev) => range.addEventListener(ev, rated));
   const applyKind = () => {
     const k = methodKind(fm.method.value === "__new" ? fm.new_method.value : fm.method.value);
@@ -373,31 +409,140 @@ async function reviewView(bagId, method) {
   };
   const RECIPE_KEYS = ["grinder", "grind", "brewer", "dose_g", "water_g", "temp", "brew_time", "recipe"];
   RECIPE_KEYS.forEach((k) => fm[k].addEventListener("input", () => { fm[k].dataset.touched = "1"; }));
+
+  const checkInStore = () => {
+    if (fm.grinder.value.trim().toLowerCase() === "in store") {
+      fm.grind.value = "";
+      delete fm.grind.dataset.touched;
+    }
+  };
+  fm.grinder.addEventListener("input", checkInStore);
+  fm.grinder.addEventListener("change", checkInStore);
+  checkInStore();
+
   const preHint = (p, m) => {
     $("#prehint").textContent = existing || !p ? "" : p.source === "last" ? `Recipe filled in from the last time you brewed ${m}.`
       : p.source === "preset" ? `Equipment filled in from your ${m} preset (More → Brew methods).` : "";
   };
   preHint(method && prefill, method);
-  const refill = async () => {
-    const m = fm.method.value;
+  const ratio = () => { const d = parseFloat(fm.dose_g.value), w = parseFloat(fm.water_g.value); $("#ratio").value = d && w ? `1:${(w / d).toFixed(1)}` : ""; };
+  fm.dose_g.oninput = fm.water_g.oninput = ratio; ratio();
+
+  const refill = async (targetMethod) => {
+    const m = targetMethod ?? (fm.method.value === "__new" ? fm.new_method.value.trim() : fm.method.value);
     if (existing || !m || m === "__new") return;
     const p = await api(`last-recipe?method=${encodeURIComponent(m)}&coffee_id=${b.coffee.id}`);
     for (const k of RECIPE_KEYS) if (!fm[k].dataset.touched) fm[k].value = p[k] ?? "";
-    ratio(); preHint(p, m);
+    checkInStore(); ratio(); preHint(p, m);
   };
-  fm.method.onchange = () => { $("#newm").classList.toggle("hidden", fm.method.value !== "__new"); applyKind(); refill(); };
-  fm.new_method.oninput = applyKind;
+  const debouncedRefill = debounce((m) => refill(m), 250);
+
+  const syncChips = () => {
+    const curF = new Set(fm.flavors.value.toLowerCase().split(",").map((s) => s.trim()));
+    $$("[data-f]").forEach((x) => x.classList.toggle("on", curF.has(x.dataset.f)));
+  };
+  const wireChips = () => {
+    $$("[data-f]").forEach((x) => x.onclick = () => {
+      const cur = fm.flavors.value.split(",").map((s) => s.trim()).filter(Boolean);
+      const i = cur.findIndex((s) => s.toLowerCase() === x.dataset.f);
+      if (i >= 0) cur.splice(i, 1); else cur.push(x.dataset.f);
+      fm.flavors.value = cur.join(", "); x.classList.toggle("on", i < 0);
+    });
+    syncChips();
+  };
+  wireChips();
+
+  const updateMethodOptions = (selectedVal) => {
+    taken = new Set(b.reviews.map((x) => x.method.toLowerCase()));
+    methods = [...new Set([...f.methods, ...b.reviews.map((x) => x.method), ...(selectedVal && selectedVal !== "__new" ? [selectedVal] : [])])];
+    fm.method.innerHTML = renderMethodOptions(selectedVal);
+  };
+
+  const onMethodOrBagChange = async (bagChanged) => {
+    if (bagChanged) {
+      const newBagId = +fm.bag_id.value;
+      if (newBagId !== bagId) {
+        bagId = newBagId;
+        b = await api("bags/" + bagId);
+        const crumb = $(".crumb");
+        if (crumb) {
+          crumb.href = `#/bag/${bagId}`;
+          crumb.textContent = `← ${b.coffee.name} · ${b.roaster.name}`;
+        }
+        const roastInfo = $("#roast-info");
+        if (roastInfo) roastInfo.textContent = b.roast_date ? `Roasted ${fmtDay(b.roast_date)}` : "";
+        const cancelBtn = $(".actions a.btn");
+        if (cancelBtn) cancelBtn.href = `#/bag/${bagId}`;
+        const sugg = getSugg();
+        $("#fl").innerHTML = sugg.map((s) => `<button type="button" class="chip" data-f="${esc(s)}">${esc(s)}</button>`).join("");
+        wireChips();
+        updateMethodOptions(fm.method.value);
+      }
+    }
+    $("#newm").classList.toggle("hidden", fm.method.value !== "__new");
+    applyKind();
+
+    const m = fm.method.value === "__new" ? fm.new_method.value.trim() : fm.method.value;
+    const found = (m && m !== "__new") ? b.reviews.find((rv) => rv.method.toLowerCase() === m.toLowerCase()) : null;
+
+    if (found) {
+      existing = found;
+      if (existing.rating != null) {
+        range.value = existing.rating;
+        delete range.dataset.unset;
+        $("#rv").innerHTML = rate(existing.rating);
+        if ($("#rhint")) $("#rhint").classList.add("hidden");
+      } else {
+        range.value = 7;
+        range.dataset.unset = "1";
+        $("#rv").innerHTML = rate(null);
+        if ($("#rhint")) {
+          $("#rhint").classList.remove("hidden");
+          $("#rhint").textContent = "Not rated yet: tap or slide the bar";
+        }
+      }
+      fm.flavors.value = existing.flavors || "";
+      syncChips();
+      fm.notes.value = existing.notes || "";
+      fm.brewed_on.value = existing.brewed_on || todayISO();
+      for (const k of RECIPE_KEYS) {
+        fm[k].value = existing[k] ?? "";
+        delete fm[k].dataset.touched;
+      }
+      checkInStore();
+      ratio();
+      $("h1").textContent = `Edit review: ${existing.method}`;
+      if ($("#del")) $("#del").classList.remove("hidden");
+      $("#prehint").textContent = "";
+    } else {
+      const hadExisting = existing != null;
+      existing = null;
+      if ($("#del")) $("#del").classList.add("hidden");
+      $("h1").textContent = `Review${m && m !== "__new" ? ": " + m : ""}`;
+      if (hadExisting || bagChanged) {
+        range.value = 7;
+        range.dataset.unset = "1";
+        $("#rv").innerHTML = rate(null);
+        if ($("#rhint")) {
+          $("#rhint").classList.remove("hidden");
+          $("#rhint").textContent = "Not rated yet: tap or slide the bar";
+        }
+        fm.flavors.value = "";
+        syncChips();
+        fm.notes.value = "";
+        fm.brewed_on.value = todayISO();
+      }
+      for (const k of RECIPE_KEYS) {
+        delete fm[k].dataset.touched;
+      }
+      await refill();
+    }
+  };
+
+  fm.method.onchange = () => onMethodOrBagChange(false);
+  if (fm.bag_id) fm.bag_id.onchange = () => onMethodOrBagChange(true);
+  fm.new_method.oninput = () => { applyKind(); debouncedRefill(fm.new_method.value); };
   applyKind();
-  const ratio = () => { const d = parseFloat(fm.dose_g.value), w = parseFloat(fm.water_g.value); $("#ratio").value = d && w ? `1:${(w / d).toFixed(1)}` : ""; };
-  fm.dose_g.oninput = fm.water_g.oninput = ratio; ratio();
-  $$("[data-f]").forEach((x) => x.onclick = () => {
-    const cur = fm.flavors.value.split(",").map((s) => s.trim()).filter(Boolean);
-    const i = cur.findIndex((s) => s.toLowerCase() === x.dataset.f);
-    if (i >= 0) cur.splice(i, 1); else cur.push(x.dataset.f);
-    fm.flavors.value = cur.join(", "); x.classList.toggle("on", i < 0);
-  });
-  const curF = new Set(fm.flavors.value.toLowerCase().split(",").map((s) => s.trim()));
-  $$("[data-f]").forEach((x) => x.classList.toggle("on", curF.has(x.dataset.f)));
   fm.onsubmit = async (e) => {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(fm));
@@ -407,7 +552,10 @@ async function reviewView(bagId, method) {
     if (range.dataset.unset) {
       if (!fm.dataset.noRatingOk) {  // first Save without a rating: say so once; a second Save goes through
         fm.dataset.noRatingOk = "1";
-        $("#rhint") && ($("#rhint").textContent = "No rating yet. Tap the bar to rate, or tap Save again to save without one.");
+        if ($("#rhint")) {
+          $("#rhint").classList.remove("hidden");
+          $("#rhint").textContent = "No rating yet. Tap the bar to rate, or tap Save again to save without one.";
+        }
         toast("No rating yet. Tap Save again to save without one.");
         $("#rv").scrollIntoView({ block: "center", behavior: "smooth" });
         return;
@@ -423,7 +571,7 @@ async function reviewView(bagId, method) {
     } catch (err) { toast(err.message); }
   };
   $("#del") && ($("#del").onclick = async () => {
-    if (!confirm(`Delete the ${existing.method} review?`)) return;
+    if (!existing || !confirm(`Delete the ${existing.method} review?`)) return;
     await api("reviews/" + existing.id, { method: "DELETE" }); S.facets = null; location.hash = `#/bag/${bagId}`;
   });
 }
@@ -527,7 +675,11 @@ async function addView(p) {
   wireBagFields(fm);
   const thumbs = () => {
     $("#thumbs").innerHTML = uploads.map((t, i) => `<span class="ti"><img src="/photos/t-${esc(t)}" alt=""><button type="button" data-rm="${i}" aria-label="Remove photo">${icon("x")}</button></span>`).join("");
-    $$("[data-rm]").forEach((x) => x.onclick = () => { uploads.splice(+x.dataset.rm, 1); thumbs(); });
+    $$("[data-rm]").forEach((x) => x.onclick = () => {
+      const [tok] = uploads.splice(+x.dataset.rm, 1);
+      api("uploads/" + tok, { method: "DELETE" }).catch(() => {});
+      thumbs();
+    });
     $("#read") && ($("#read").disabled = !uploads.length);
   };
   $$(".photo-in").forEach((inp) => inp.onchange = async (e) => {
@@ -819,12 +971,13 @@ async function moreView() {
   const draw = () => {
     $("#mlist").innerHTML = rows.map((m, i) => `<div class="mrow card-box" style="display:grid;gap:8px;padding:10px 12px">
       <div class="row"><input name="name" value="${esc(m.name)}" placeholder="Method" style="flex:1;font-weight:600">
-        <button type="button" data-up="${i}" title="Move up" ${i ? "" : "disabled"}>↑</button><button type="button" data-rm="${i}" title="Remove" aria-label="Remove method">${icon("x")}</button></div>
+        <button type="button" data-up="${i}" title="Move up" ${i ? "" : "disabled"}>↑</button><button type="button" data-dn="${i}" title="Move down" ${i === rows.length - 1 ? "disabled" : ""}>↓</button><button type="button" data-rm="${i}" title="Remove" aria-label="Remove method">${icon("x")}</button></div>
       <div class="f2"><input name="grinder" list="grinders" value="${esc(m.grinder || "")}" placeholder="Grinder">
         <input name="grind" value="${esc(m.grind || "")}" placeholder="Grind setting"></div>
       <div class="f2"><input name="brewer" list="brewers" value="${esc(m.brewer || "")}" placeholder="Brewer / machine">
         <input name="recipe" value="${esc(m.recipe || "")}" placeholder="Technique, e.g. Gold Cup mode"></div></div>`).join("");
     $$("[data-up]").forEach((x) => x.onclick = () => { rows = read(); const i = +x.dataset.up; [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; draw(); });
+    $$("[data-dn]").forEach((x) => x.onclick = () => { rows = read(); const i = +x.dataset.dn; [rows[i], rows[i + 1]] = [rows[i + 1], rows[i]]; draw(); });
     $$("[data-rm]").forEach((x) => x.onclick = () => { rows = read(); rows.splice(+x.dataset.rm, 1); draw(); });
   };
   draw();
