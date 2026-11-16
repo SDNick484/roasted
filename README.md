@@ -51,9 +51,13 @@ If you'd rather keep the whole thing private, set `PUBLIC_VIEW=0`. `/` then redi
 Without GPS, the city you type is looked up when you save (OpenStreetMap Nominatim, then Photon, which tolerates small typos), so the bag still lands on the map. A bag whose city can't be found, or that was **Bought online**, shows at the roaster's city instead (a hollow marker), and its page says so. Places that were never looked up, e.g. while a lookup service was down, are retried a few at a time when the map opens.
 
 ## Reviewing
-On a bag, tap a method chip (**＋ Drip**, **＋ Cold brew**, **＋ Nitro cold brew**, **＋ French press**, **＋ Pour over**, **＋ Percolator**…). The recipe fields follow the method: cold brew, nitro and French press ask for steep time, the percolator for perk time, espresso for yield and shot time. For a method you've used before, the recipe (grinder, grind, dose, water, temp, time) is pre-filled from the last time you brewed it, using the same coffee's recipe first if there is one. Ratings are 0–10 in halves.
+To jump straight into logging or updating a brew, tap **＋ Brew** (`#/brew`) in the top navigation, on the *On the shelf* header, or on any bag's detail page. You can pick which bag you're brewing from open or finished bags and seamlessly switch brew methods or bags to create or edit reviews.
 
-**Equipment presets** pre-fill each method's first review. Edit them under **More → Brew methods**:
+On a bag, you can also tap a method chip (**＋ Drip**, **＋ Cold brew**, **＋ Nitro cold brew**, **＋ French press**, **＋ Pour over**, **＋ Percolator**…). The recipe fields follow the method: cold brew, nitro and French press ask for steep time, the percolator for perk time, espresso for yield and shot time. For a method you've used before, the recipe (grinder, grind, dose, water, temp, time) is pre-filled from the last time you brewed it, using the same coffee's recipe first if there is one. Ratings are 0–10 in halves.
+
+If a bag was ground at the café or shop, choose **In Store** as the grinder—the grind setting is automatically cleared.
+
+**Equipment presets** pre-fill each method's first review, with smart grinder defaults (`Eureka Mignon Zero 55mm` @ `4` for espresso, `Baratza Encore (M2 burrs)` for coffee). Edit them under **More → Brew methods**:
 
 | Method | Grinder | Setting | Brewer | Technique |
 |---|---|---|---|---|
