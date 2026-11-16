@@ -31,8 +31,8 @@ if [ -n "$BACKUP_TARGET" ]; then
   if [ -d "$BACKUP_TARGET" ] && [ -w "$BACKUP_TARGET" ]; then
     mkdir -p "$BACKUP_TARGET/db/$STAMP" "$BACKUP_TARGET/files/roasted/photos"
     cp -a "$out.gz" "$BACKUP_TARGET/db/$STAMP/" 2>/dev/null || fail=1
-    # photos are write-once: copy new files only
-    cp -au /var/lib/roasted/photos/. "$BACKUP_TARGET/files/roasted/photos/" || fail=1
+    # photos are write-once: copy new files only (skip staged tmp uploads)
+    find /var/lib/roasted/photos -maxdepth 1 -type f ! -name 'tmp-*' ! -name 't-tmp-*' -exec cp -au -t "$BACKUP_TARGET/files/roasted/photos/" {} + || fail=1
     log "roasted copied to $BACKUP_TARGET"
   else
     log "FAILED: BACKUP_TARGET $BACKUP_TARGET is not a writable directory (is it mounted?)"; fail=1

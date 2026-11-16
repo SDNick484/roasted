@@ -153,3 +153,177 @@ def test_map_places_bags_and_falls_back_to_roaster(monkeypatch):
     # the public view never shows GPS points or lookup flags
     pub = c.get(f"/api/bags/{typo['id']}", headers={"Cf-Ray": "x"}).get_json()
     assert "lat" not in pub and "geo_tried" not in pub and "map" not in pub and "lat" not in pub["roaster"]
+
+
+def test_roaster_privacy_endpoints():
+    bag = add_bag(roaster={"name": "Privacy Roasters", "city": "Oakland", "country": "USA"},
+                  coffee={"name": "Privacy Blend"})
+    con = coffee.connect()
+    rid = bag["roaster"]["id"]
+    con.execute("UPDATE roasters SET lat=37.8, lng=-122.2, geo_tried=1 WHERE id=?", (rid,))
+    con.commit()
+
+    # Public views must never expose lat, lng, or geo_tried on roasters
+    pub_roasters = c.get("/api/roasters", headers={"Cf-Ray": "x"}).get_json()["roasters"]
+    pub_r = next(r for r in pub_roasters if r["id"] == rid)
+    assert "lat" not in pub_r and "lng" not in pub_r and "geo_tried" not in pub_r
+
+    pub_roaster = c.get(f"/api/roasters/{rid}", headers={"Cf-Ray": "x"}).get_json()
+    assert "lat" not in pub_roaster and "lng" not in pub_roaster and "geo_tried" not in pub_roaster
+
+    pub_coffee = c.get(f"/api/coffees/{bag['coffee']['id']}", headers={"Cf-Ray": "x"}).get_json()
+    assert "lat" not in pub_coffee["roaster"] and "lng" not in pub_coffee["roaster"] and "geo_tried" not in pub_coffee["roaster"]
+
+    # Private views show lat and lng, but strip geo_tried
+    priv_roaster = c.get(f"/admin/api/roasters/{rid}").get_json()
+    assert priv_roaster["lat"] == 37.8 and priv_roaster["lng"] == -122.2 and "geo_tried" not in priv_roaster
+
+    priv_coffee = c.get(f"/admin/api/coffees/{bag['coffee']['id']}").get_json()
+    assert priv_coffee["roaster"]["lat"] == 37.8 and "geo_tried" not in priv_coffee["roaster"]
+
+
+def test_backfill_locations_per_row_commit(monkeypatch):
+    bag = add_bag(bag={"city": "Ventura", "lat": None, "lng": None})
+    con = coffee.connect()
+    # Ensure two bags pending geocoding
+    bid1 = bag["id"]
+    bid2 = con.execute("INSERT INTO bags(coffee_id, city, online, geo_tried) VALUES (?, 'Ojai', 0, 0)",
+                       (bag["coffee_id"],)).lastrowid
+    con.execute("UPDATE bags SET lat=NULL, lng=NULL, geo_tried=0 WHERE id=?", (bid1,))
+    con.commit()
+
+    committed_while_in_loop = []
+
+    def mock_geocode(city, region, country):
+        if city == "Ventura":
+            return 34.28, -119.29
+        # While geocoding the second bag, check if first bag was already committed
+        con2 = coffee.connect()
+        row = con2.execute("SELECT lat, geo_tried FROM bags WHERE id=?", (bid1,)).fetchone()
+        con2.close()
+        committed_while_in_loop.append(tuple(row))
+        return 34.44, -119.24
+
+    monkeypatch.setattr(coffee, "geocode_place", mock_geocode)
+    monkeypatch.setattr(coffee.time, "sleep", lambda s: None)
+
+    main_con = coffee.connect()
+    coffee.backfill_locations(main_con, budget=2)
+    main_con.close()
+
+    assert committed_while_in_loop == [(34.28, 1)]
+
+
+def test_method_casing_and_rename_consistency():
+    bag = add_bag(coffee={"name": "Method Test Beans"})
+    bid = bag["id"]
+
+    # Upsert with lowercase method name, then update with canonical/uppercase
+    r1 = c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "chemex", "rating": 7.5})
+    assert r1.status_code == 201
+    assert r1.get_json()["review"]["method"] == "Chemex"
+
+    # Second put with different casing updates in-place without duplicate
+    r2 = c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "CHEMEX", "rating": 8.5})
+    assert r2.status_code == 200
+    assert r2.get_json()["review"]["id"] == r1.get_json()["review"]["id"]
+    assert r2.get_json()["review"]["rating"] == 8.5
+
+    # Changing old_method to an existing method case-insensitively returns 409
+    c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "AeroPress", "rating": 8.0})
+    r_conflict = c.put(f"/admin/api/bags/{bid}/reviews", json={"old_method": "AeroPress", "method": "chemex"})
+    assert r_conflict.status_code == 409
+
+    # PUT /admin/api/methods renames method casing and cascades to existing reviews
+    c.put("/admin/api/methods", json={"methods": ["CHEMEX", "AeroPress"]})
+    con = coffee.connect()
+    methods_in_db = {r[0] for r in con.execute("SELECT method FROM reviews WHERE bag_id=?", (bid,)).fetchall()}
+    assert "CHEMEX" in methods_in_db and "Chemex" not in methods_in_db
+
+    # Updating the review now continues to work without duplicating
+    r3 = c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "chemex", "rating": 9.0})
+    assert r3.status_code == 200
+    revs = c.get(f"/admin/api/bags/{bid}").get_json()["reviews"]
+    assert len(revs) == 2
+
+
+def test_staged_uploads_cleanup_and_delete(monkeypatch):
+    import time
+    # Upload staged photo
+    up = c.post("/admin/api/uploads", data={"file": (jpeg(), "test.jpg")}, content_type="multipart/form-data")
+    assert up.status_code == 200
+    token = up.get_json()["uploads"][0]
+    assert (coffee.PHOTO_DIR / token).exists()
+    assert (coffee.PHOTO_DIR / ("t-" + token)).exists()
+
+    # Reject non-tmp and invalid filenames
+    assert c.delete("/admin/api/uploads/not-tmp.jpg").status_code == 400
+    assert c.delete("/admin/api/uploads/1-abcdef1234.jpg").status_code == 400
+    assert c.delete("/admin/api/uploads/tmp-toolong12345678.jpg").status_code == 400
+
+    # Auth check: unauthorized requests rejected
+    assert c.delete(f"/admin/api/uploads/{token}", headers={"Cf-Ray": "x"}).status_code == 401
+
+    # Valid DELETE removes both full image and thumbnail
+    del_res = c.delete(f"/admin/api/uploads/{token}")
+    assert del_res.status_code == 200 and del_res.get_json()["ok"] is True
+    assert not (coffee.PHOTO_DIR / token).exists()
+    assert not (coffee.PHOTO_DIR / ("t-" + token)).exists()
+
+    # Stale upload cleanup removes old tmp-* and t-tmp-* files
+    old_file = coffee.PHOTO_DIR / "tmp-0123456789.jpg"
+    old_thumb = coffee.PHOTO_DIR / "t-tmp-0123456789.jpg"
+    recent_file = coffee.PHOTO_DIR / "tmp-9876543210.jpg"
+    old_file.write_bytes(b"old")
+    old_thumb.write_bytes(b"old thumb")
+    recent_file.write_bytes(b"recent")
+
+    old_mtime = time.time() - 3 * 86400
+    os.utime(old_file, (old_mtime, old_mtime))
+    os.utime(old_thumb, (old_mtime, old_mtime))
+
+    coffee.cleanup_tmp_uploads()
+    assert not old_file.exists()
+    assert not old_thumb.exists()
+    assert recent_file.exists()
+    recent_file.unlink()
+
+
+def test_parse_label_non_greedy():
+    import pytest
+    text = """Here is the JSON:
+    {"roaster": {"name": "Blue Bottle", "city": "Oakland"},
+     "coffee": {"name": "Bella Donovan", "origin": "Ethiopia, Sumatra", "is_blend": true},
+     "bag": {"weight": "12 oz", "price": 18.5},
+     "uncertain": []}
+    Trailing commentary with braces: {note: blend of washed and natural coffees; best at 200F}"""
+    parsed = coffee.parse_label(text)
+    assert parsed["roaster"]["name"] == "Blue Bottle"
+    assert parsed["coffee"]["origin"] == "Ethiopia, Sumatra"
+    assert parsed["coffee"]["is_blend"] is True
+    assert parsed["bag"]["weight"] == "12 oz"
+
+    with pytest.raises(ValueError, match="No JSON in the response"):
+        coffee.parse_label("No braces in this text")
+
+
+def test_stats_consistent_origin_review_counts():
+    bag = add_bag(coffee={"name": "Multi Origin Test", "origin": "Rwanda, Bolivia", "process": "Honey", "roast_level": "Light"})
+    bid = bag["id"]
+
+    # One rated review, one unrated review
+    c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "V60", "rating": 8.0})
+    c.put(f"/admin/api/bags/{bid}/reviews", json={"method": "Drip"})  # unrated review
+
+    stats = c.get("/admin/api/stats").get_json()
+    origins = {o["name"]: o for o in stats["by_origin"]}
+    assert origins["Rwanda"]["n"] == 2
+    assert origins["Rwanda"]["avg"] == 8.0
+    assert origins["Bolivia"]["n"] == 2
+    assert origins["Bolivia"]["avg"] == 8.0
+
+    # Matches by_process and by_roast counting both rated and unrated reviews
+    proc = next(p for p in stats["by_process"] if p["name"] == "honey")
+    assert proc["n"] == 2
+    roast = next(r for r in stats["by_roast"] if r["name"] == "light")
+    assert roast["n"] == 2
