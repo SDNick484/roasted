@@ -147,6 +147,17 @@ def migrate(con):
         con.execute("ALTER TABLE bags ADD COLUMN geo_tried INTEGER NOT NULL DEFAULT 0")
 
 
+def cleanup_tmp_uploads(max_age_seconds=2 * 86400):
+    cutoff = time.time() - max_age_seconds
+    for pattern in ("tmp-*", "t-tmp-*"):
+        for p in PHOTO_DIR.glob(pattern):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
@@ -161,11 +172,7 @@ def init_db():
     con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', '2')")
     con.commit()
     con.close()
-    # staged uploads that never became a bag
-    cutoff = time.time() - 2 * 86400
-    for p in PHOTO_DIR.glob("tmp-*"):
-        if p.stat().st_mtime < cutoff:
-            p.unlink(missing_ok=True)
+    cleanup_tmp_uploads()
 
 
 # =========================================================================== helpers
@@ -356,6 +363,17 @@ PRIVATE_BAG = ("price", "currency", "notes", "lat", "lng", "added_by", "geo_trie
 PRIVATE_REVIEW = ("reviewed_by",)
 
 
+def roaster_out(r, private: bool) -> dict:
+    if r is None:
+        return None
+    d = dict(r)
+    d.pop("geo_tried", None)
+    if not private:
+        d.pop("lat", None)
+        d.pop("lng", None)
+    return d
+
+
 def photos_for(bag_ids):
     out = {}
     if not bag_ids:
@@ -492,7 +510,7 @@ def coffee_detail(coffee_id, private):
     if not rows:
         abort(404)
     c = rows[0]
-    c["roaster"] = dict(db().execute("SELECT * FROM roasters WHERE id=?", (c["roaster_id"],)).fetchone())
+    c["roaster"] = roaster_out(db().execute("SELECT * FROM roasters WHERE id=?", (c["roaster_id"],)).fetchone(), private)
     bags = db().execute("SELECT * FROM bags WHERE coffee_id=? ORDER BY coalesce(purchased_on, created_at) DESC",
                         (coffee_id,)).fetchall()
     ph = photos_for([b["id"] for b in bags])
@@ -519,15 +537,12 @@ def get_bag(bag_id, private):
     d = bag_out(b, private, photos_for([bag_id]))
     c = coffee_rows("id=?", [b["coffee_id"]])[0]
     d["coffee"] = c
-    d["roaster"] = dict(db().execute("SELECT * FROM roasters WHERE id=?", (c["roaster_id"],)).fetchone())
+    d["roaster"] = roaster_out(db().execute("SELECT * FROM roasters WHERE id=?", (c["roaster_id"],)).fetchone(), private)
     d["reviews"] = [review_out(r, private, b["roast_date"]) for r in db().execute(
         "SELECT * FROM reviews WHERE bag_id=? ORDER BY coalesce(brewed_on, updated_at) DESC", (bag_id,))]
     if private:
         d["map"] = ("bought" if b["lat"] is not None else
                     "roaster" if d["roaster"].get("lat") is not None else None)
-    d["roaster"].pop("geo_tried", None)
-    if not private:
-        d["roaster"].pop("lat", None); d["roaster"].pop("lng", None)
     d["other_bags"] = [dict(r) for r in db().execute(
         "SELECT id, purchased_on, shop, city FROM bags WHERE coffee_id=? AND id<>? ORDER BY purchased_on DESC",
         (b["coffee_id"], bag_id))]
@@ -535,7 +550,7 @@ def get_bag(bag_id, private):
 
 
 def list_roasters(private):
-    rows = [dict(r) for r in db().execute("""
+    rows = [roaster_out(r, private) for r in db().execute("""
         SELECT r.*, count(DISTINCT c.id) AS coffee_count, count(DISTINCT b.id) AS bag_count,
           (SELECT avg(v.rating) FROM reviews v JOIN bags b2 ON b2.id=v.bag_id JOIN coffees c2 ON c2.id=b2.coffee_id
              WHERE c2.roaster_id=r.id) AS avg_rating,
@@ -560,7 +575,7 @@ def get_roaster(roaster_id, private):
     r = db().execute("SELECT * FROM roasters WHERE id=?", (roaster_id,)).fetchone()
     if not r:
         abort(404)
-    d = dict(r)
+    d = roaster_out(r, private)
     d["coffees"] = coffee_rows("roaster_id=?", [roaster_id], "last_bought DESC")
     best = coffee_best_methods([c["id"] for c in d["coffees"]])
     for c in d["coffees"]:
@@ -638,14 +653,15 @@ def stats_data(private):
     }
     origins = {}
     for r in con.execute(
-            "SELECT c.origin, v.rating FROM coffees c LEFT JOIN bags b ON b.coffee_id=c.id "
-            "LEFT JOIN reviews v ON v.bag_id=b.id WHERE c.origin IS NOT NULL"):
+            "SELECT c.origin, v.id, v.rating FROM coffees c JOIN bags b ON b.coffee_id=c.id "
+            "JOIN reviews v ON v.bag_id=b.id WHERE c.origin IS NOT NULL"):
         for part in split_list(r[0]):
-            o = origins.setdefault(part, {"name": part, "ratings": []})
-            if r[1] is not None:
-                o["ratings"].append(r[1])
+            o = origins.setdefault(part, {"name": part, "n": 0, "ratings": []})
+            o["n"] += 1
+            if r[2] is not None:
+                o["ratings"].append(r[2])
     out["totals"]["origins"] = len(origins)
-    out["by_origin"] = sorted(({"name": o["name"], "n": len(o["ratings"]),
+    out["by_origin"] = sorted(({"name": o["name"], "n": o["n"],
                                 "avg": sum(o["ratings"]) / len(o["ratings"]) if o["ratings"] else None}
                                for o in origins.values()), key=lambda x: (-x["n"], x["name"]))
     out["by_method"] = [dict(r) for r in con.execute(
@@ -799,6 +815,7 @@ def remove_image(name):
 @editor_required
 def upload_staged():
     """Photos taken before the bag exists (add flow). Returns tokens to attach on save or read with Claude."""
+    cleanup_tmp_uploads()
     files = request.files.getlist("file")
     if not files:
         return make_err(400, "No image")
@@ -809,6 +826,15 @@ def upload_staged():
         except Exception as e:  # noqa: BLE001
             return make_err(400, f"Couldn't read that image: {e}")
     return jsonify(uploads=out)
+
+
+@app.delete("/admin/api/uploads/<token>")
+@editor_required
+def delete_staged_upload(token):
+    if not re.fullmatch(r"tmp-[0-9a-f]{10}\.jpg", token or ""):
+        return make_err(400, "Invalid upload token")
+    remove_image(token)
+    return jsonify(ok=True)
 
 
 def attach_uploads(bag_id, tokens):
@@ -1148,10 +1174,10 @@ def backfill_locations(con, budget=4):
         if kind == "bag":
             ll = geocode_place(r["city"], r["region"], r["country"])
             con.execute("UPDATE bags SET lat=?, lng=?, geo_tried=1 WHERE id=?", (*(ll or (None, None)), r["id"]))
+            con.commit()
         else:
             locate_roaster(con, r["id"])
-    if pending:
-        con.commit()
+            con.commit()
 
 
 @app.post("/admin/api/bags")
@@ -1270,11 +1296,11 @@ def upsert_review(bag_id, method, data):
         abort(make_err(404, "No such bag"))
     method = canonical_method(method)
     vals = review_values(data)
-    existing = con.execute("SELECT id FROM reviews WHERE bag_id=? AND method=?", (bag_id, method)).fetchone()
+    existing = con.execute("SELECT id FROM reviews WHERE bag_id=? AND method=? COLLATE NOCASE", (bag_id, method)).fetchone()
     if existing:
-        if vals:
-            con.execute(f"UPDATE reviews SET {','.join(f'{k}=?' for k in vals)}, reviewed_by=coalesce(?, reviewed_by), "
-                        "updated_at=CURRENT_TIMESTAMP WHERE id=?", [*vals.values(), who(), existing["id"]])
+        set_clauses = ["method=?"] + [f"{k}=?" for k in vals] + ["reviewed_by=coalesce(?, reviewed_by)", "updated_at=CURRENT_TIMESTAMP"]
+        con.execute(f"UPDATE reviews SET {', '.join(set_clauses)} WHERE id=?",
+                    [method, *vals.values(), who(), existing["id"]])
         rid = existing["id"]
     else:
         vals.setdefault("brewed_on", today())
@@ -1296,7 +1322,7 @@ def put_review(bag_id):
     if old and new and old.lower() != new.lower():  # method changed while editing
         con = db()
         newc = canonical_method(new)
-        if con.execute("SELECT 1 FROM reviews WHERE bag_id=? AND method=?", (bag_id, newc)).fetchone():
+        if con.execute("SELECT 1 FROM reviews WHERE bag_id=? AND method=? COLLATE NOCASE", (bag_id, newc)).fetchone():
             return make_err(409, f"This bag already has a {newc} review — edit that one instead")
         con.execute("UPDATE reviews SET method=? WHERE bag_id=? AND method=? COLLATE NOCASE", (newc, bag_id, old))
     rid, method, created = upsert_review(bag_id, new, data)
@@ -1358,6 +1384,7 @@ def set_methods():
     for i, (n, p, has_preset) in enumerate(rows):
         con.execute("INSERT INTO methods(name, pos, hidden) VALUES (?,?,0) "
                     "ON CONFLICT(name) DO UPDATE SET name=excluded.name, pos=excluded.pos, hidden=0", (n, i))
+        con.execute("UPDATE reviews SET method=? WHERE method=? COLLATE NOCASE AND method<>?", (n, n, n))
         if has_preset:
             con.execute("UPDATE methods SET grinder=?, grind=?, brewer=?, recipe=? WHERE name=? COLLATE NOCASE",
                         (p["grinder"], p["grind"], p["brewer"], p["recipe"], n))
@@ -1453,10 +1480,10 @@ def call_claude(images, prompt):
 
 
 def parse_label(text):
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    start = text.find("{")
+    if start == -1:
         raise ValueError("No JSON in the response")
-    data = json.loads(m.group())
+    data = json.JSONDecoder().raw_decode(text[start:])[0]
     out = {"roaster": {}, "coffee": {}, "bag": {}, "uncertain": [str(x) for x in data.get("uncertain") or []][:10]}
     for sect, keys in (("roaster", ROASTER_FIELDS), ("coffee", COFFEE_FIELDS),
                        ("bag", ("roast_date", "roast_date_printed", "weight", "price", "currency"))):
